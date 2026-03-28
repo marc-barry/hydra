@@ -1,0 +1,178 @@
+name: Build and Scan Hydra
+
+on:
+  workflow_dispatch:
+    inputs:
+      hydra_version:
+        description: "Hydra release tag (e.g. v26.2.0)"
+        required: true
+        type: string
+      go_version:
+        description: "Go version (e.g. 1.26.1). Leave empty for latest."
+        required: false
+        type: string
+  schedule:
+    # Weekly rebuild — picks up Go patch releases
+    - cron: "0 8 * * 1"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      hydra_version: ${{ steps.vars.outputs.hydra_version }}
+      go_version: ${{ steps.vars.outputs.go_version }}
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Resolve versions
+        id: vars
+        run: |
+          HYDRA_VERSION="${{ inputs.hydra_version || 'v26.2.0' }}"
+          echo "hydra_version=${HYDRA_VERSION}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "${{ inputs.go_version }}" ]; then
+            GO_VERSION="${{ inputs.go_version }}"
+          else
+            # Fetch latest stable Go version
+            GO_VERSION=$(curl -sL 'https://go.dev/dl/?mode=json' | jq -r '.[0].version' | sed 's/^go//')
+          fi
+          echo "go_version=${GO_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${HYDRA_VERSION}-go${GO_VERSION}" >> "$GITHUB_OUTPUT"
+
+          echo "Building Hydra ${HYDRA_VERSION} with Go ${GO_VERSION}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            GO_VERSION=${{ steps.vars.outputs.go_version }}
+            HYDRA_VERSION=${{ steps.vars.outputs.hydra_version }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.hydra_version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+  scan:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    env:
+      TRIVY_DISABLE_VEX_NOTICE: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Scan our image
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}"
+          trivyignores: ".trivyignore"
+          format: "json"
+          output: "trivy-our-image.json"
+          severity: "CRITICAL,HIGH,MEDIUM,LOW"
+          exit-code: "0"
+
+      - name: Scan official Ory Hydra image
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: "oryd/hydra:${{ needs.build.outputs.hydra_version }}"
+          format: "json"
+          output: "trivy-official-image.json"
+          severity: "CRITICAL,HIGH,MEDIUM,LOW"
+          exit-code: "0"
+
+      - name: Build scan summary
+        id: scan-summary
+        uses: actions/github-script@v7
+        env:
+          OUR_IMAGE: "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}"
+          OFFICIAL_IMAGE: "oryd/hydra:${{ needs.build.outputs.hydra_version }}"
+          FAIL_ON_SEVERITIES: "CRITICAL,HIGH"
+        with:
+          script: |
+            const fs = require('fs');
+
+            const SEVERITY_LABEL = {
+              CRITICAL: '🔴 **CRITICAL**',
+              HIGH: '🟠 **HIGH**',
+              MEDIUM: '🟡 MEDIUM',
+              LOW: '⚪ LOW'
+            };
+
+            function parseVulns(file) {
+              const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+              return (data.Results || []).flatMap(r =>
+                (r.Vulnerabilities || []).map(v => ({ ...v, target: r.Target }))
+              );
+            }
+
+            function buildTable(vulns) {
+              if (vulns.length === 0) return '_No vulnerabilities found._\n';
+              let t = '| Library | CVE | Severity | Installed | Fixed | Title |\n';
+              t += '|---|---|---|---|---|---|\n';
+              for (const v of vulns) {
+                const title = (v.Title || '').replace(/\|/g, '\\|').substring(0, 80);
+                const cve = v.PrimaryURL ? `[${v.VulnerabilityID}](${v.PrimaryURL})` : v.VulnerabilityID;
+                t += `| ${v.PkgName} | ${cve} | ${SEVERITY_LABEL[v.Severity] || v.Severity} | ${v.InstalledVersion} | ${v.FixedVersion || 'N/A'} | ${title} |\n`;
+              }
+              return t;
+            }
+
+            const ourVulns = parseVulns('trivy-our-image.json');
+            const officialVulns = parseVulns('trivy-official-image.json');
+
+            const blockingSeverities = new Set(
+              (process.env.FAIL_ON_SEVERITIES || '').split(',').map(s => s.trim()).filter(Boolean)
+            );
+            const hasBlocking = ourVulns.some(v => blockingSeverities.has(v.Severity));
+            core.setOutput('has_blocking', hasBlocking.toString());
+
+            let summary = `## Vulnerability Scan Results\n\n`;
+            summary += `### Our image: \`${process.env.OUR_IMAGE}\`\n\n`;
+            summary += buildTable(ourVulns);
+            summary += `\n### Official image: \`${process.env.OFFICIAL_IMAGE}\`\n\n`;
+            summary += buildTable(officialVulns);
+
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+
+      - name: Convert to SARIF
+        if: "!cancelled()"
+        run: trivy convert --format sarif --output trivy-results.sarif trivy-our-image.json
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: "!cancelled()"
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Fail on blocking vulnerabilities
+        if: steps.scan-summary.outputs.has_blocking == 'true'
+        run: |
+          echo "Blocking vulnerabilities found (CRITICAL,HIGH). Failing build."
+          exit 1

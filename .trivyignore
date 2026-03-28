@@ -1,0 +1,5 @@
+# github.com/jackc/pgproto3/v2 - DoS vulnerability (GHSA-jqcq-xjh3-6g23)
+# No fix available: v2 is deprecated, the fix is in v3 (used by pgx/v5).
+# This is a transitive dependency pulled in by pgconn v1; Hydra uses pgx/v5
+# with pgproto3/v3 for actual database communication. Low risk.
+GHSA-jqcq-xjh3-6g23
